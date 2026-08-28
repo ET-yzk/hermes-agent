@@ -6,9 +6,16 @@ Covers the ownership guarantees required for the DM-fallback fix:
    worker-thread tool calls (no cross-principal aliasing);
 2. stale A disconnect after B has published does not clear B
    (compare-and-remove teardown);
-3. reconnect replacement publication survives old-generation teardown;
+3. reconnect / replacement-adapter publication survives old-generation
+   teardown, including across adapter instances (per-profile monotonic
+   generation allocation — no cross-instance collision);
 4. failed publication never leaves a discoverable binding (no publish
-   before a successful connect).
+   before a successful connect);
+5. the HERMES_HOME contextvar override installed by the multiplex
+   gateway's ``_profile_runtime_scope`` reaches the tool worker thread
+   through the real propagation chain (``copy_context()`` via
+   ``propagate_context_to_thread``), so each profile's turn resolves only
+   its own client with no explicit profile_key.
 """
 
 import threading
@@ -35,7 +42,7 @@ class TestFeishuClientBindingRegistry(unittest.TestCase):
 
     def test_publish_resolve_same_profile(self):
         client = object()
-        binding.publish(client, generation=1, profile_key="/profiles/a")
+        binding.publish(client, profile_key="/profiles/a")
         self.assertIs(
             binding.resolve(profile_key="/profiles/a"), client
         )
@@ -43,8 +50,8 @@ class TestFeishuClientBindingRegistry(unittest.TestCase):
     def test_profile_isolation_resolves_distinct_clients(self):
         client_a = object()
         client_b = object()
-        binding.publish(client_a, generation=1, profile_key="/profiles/a")
-        binding.publish(client_b, generation=1, profile_key="/profiles/b")
+        binding.publish(client_a, profile_key="/profiles/a")
+        binding.publish(client_b, profile_key="/profiles/b")
         self.assertIs(
             binding.resolve(profile_key="/profiles/a"), client_a
         )
@@ -55,30 +62,51 @@ class TestFeishuClientBindingRegistry(unittest.TestCase):
     def test_reconnect_replaces_same_profile_binding(self):
         old = object()
         new = object()
-        binding.publish(old, generation=1, profile_key="/profiles/a")
-        binding.publish(new, generation=2, profile_key="/profiles/a")
+        gen_old = binding.publish(old, profile_key="/profiles/a")
+        gen_new = binding.publish(new, profile_key="/profiles/a")
+        self.assertGreater(gen_new, gen_old)
         self.assertIs(
             binding.resolve(profile_key="/profiles/a"), new
         )
 
     def test_stale_unpublish_does_not_clear_newer_binding(self):
         """A stale adapter (old generation) must not clear the newer binding."""
+        client_a = object()
         client_b = object()
-        binding.publish(client_b, generation=2, profile_key="/profiles/a")
-        binding.unpublish(generation=1, profile_key="/profiles/a")
+        gen_a = binding.publish(client_a, profile_key="/profiles/a")
+        binding.publish(client_b, profile_key="/profiles/a")
+        binding.unpublish(gen_a, profile_key="/profiles/a")
         self.assertIs(
             binding.resolve(profile_key="/profiles/a"), client_b
         )
 
+    def test_cross_instance_generation_no_collision(self):
+        """Two adapter instances for the same profile must never publish
+        colliding generations (the per-profile counter is process-wide, not
+        per-instance) — the exact hole a per-adapter counter leaves open.
+        """
+        stale_client = object()  # old adapter instance A1
+        fresh_client = object()  # replacement adapter instance A2
+
+        gen_stale = binding.publish(stale_client, profile_key="/profiles/a")
+        gen_fresh = binding.publish(fresh_client, profile_key="/profiles/a")
+        self.assertNotEqual(gen_stale, gen_fresh)
+
+        # A1's delayed teardown (old generation) must not clear A2's binding.
+        binding.unpublish(gen_stale, profile_key="/profiles/a")
+        self.assertIs(
+            binding.resolve(profile_key="/profiles/a"), fresh_client
+        )
+
     def test_matching_unpublish_clears_binding(self):
         client = object()
-        binding.publish(client, generation=3, profile_key="/profiles/a")
-        binding.unpublish(generation=3, profile_key="/profiles/a")
+        gen = binding.publish(client, profile_key="/profiles/a")
+        binding.unpublish(gen, profile_key="/profiles/a")
         self.assertIsNone(binding.resolve(profile_key="/profiles/a"))
 
     def test_unpublish_unknown_generation_is_noop(self):
-        binding.publish(object(), generation=1, profile_key="/profiles/a")
-        binding.unpublish(generation=99, profile_key="/profiles/a")
+        binding.publish(object(), profile_key="/profiles/a")
+        binding.unpublish(99, profile_key="/profiles/a")
         self.assertIsNotNone(binding.resolve(profile_key="/profiles/a"))
 
     # -- worker-thread resolution (the DM failure boundary) ----------------
@@ -98,8 +126,8 @@ class TestFeishuClientBindingRegistry(unittest.TestCase):
     def test_worker_thread_resolves_own_profile_client(self):
         client_a = object()
         client_b = object()
-        binding.publish(client_a, generation=1, profile_key="/profiles/a")
-        binding.publish(client_b, generation=1, profile_key="/profiles/b")
+        binding.publish(client_a, profile_key="/profiles/a")
+        binding.publish(client_b, profile_key="/profiles/b")
         self.assertIs(
             self._resolve_in_worker_thread(binding.resolve, "/profiles/a"),
             client_a,
@@ -111,7 +139,7 @@ class TestFeishuClientBindingRegistry(unittest.TestCase):
 
     def test_doc_and_drive_tools_resolve_profile_binding_in_worker_thread(self):
         client_a = object()
-        binding.publish(client_a, generation=1)
+        binding.publish(client_a)
         self.assertIs(
             self._resolve_in_worker_thread(doc_get_client),
             client_a,
@@ -124,7 +152,7 @@ class TestFeishuClientBindingRegistry(unittest.TestCase):
     def test_tools_prefer_thread_local_over_binding(self):
         shared = object()
         local = object()
-        binding.publish(shared, generation=1, profile_key="/profiles/a")
+        binding.publish(shared, profile_key="/profiles/a")
         from tools.feishu_doc_tool import set_client as doc_set_client
 
         doc_set_client(local)
@@ -137,6 +165,98 @@ class TestFeishuClientBindingRegistry(unittest.TestCase):
         )
         self.assertIsNone(
             self._resolve_in_worker_thread(drive_get_client)
+        )
+
+
+class TestProfileScopeContextvarPropagation(unittest.TestCase):
+    """Witness for the real DM tool path (issue #29760).
+
+    The binding key is derived from ``get_hermes_home()``, which follows the
+    ``HERMES_HOME`` contextvar override installed by the multiplex gateway's
+    ``_profile_runtime_scope``. That override reaches the tool worker thread
+    only because the gateway propagates contextvars across thread boundaries
+    (``copy_context()`` in ``_run_in_executor_with_context`` and
+    ``propagate_context_to_thread`` in the tool executor). These tests cross
+    the same boundary with the same mechanism — no explicit profile_key — so
+    a regression in any link fails here instead of cross-principal in
+    production.
+    """
+
+    def setUp(self):
+        binding.clear_all()
+        from tools.feishu_doc_tool import set_client as doc_set_client
+        from tools.feishu_drive_tool import set_client as drive_set_client
+
+        doc_set_client(None)
+        drive_set_client(None)
+
+    def tearDown(self):
+        binding.clear_all()
+
+    def _resolve_in_profile_scope(self, home, fn):
+        """Resolve ``fn()`` on a worker thread running inside a copied
+        context that carries the profile-home override — the same
+        propagation shape as the gateway's ``run_sync`` executor hop plus
+        the tool dispatch hop."""
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from tools.thread_context import propagate_context_to_thread
+
+        result = {}
+        token = set_hermes_home_override(home)
+        try:
+
+            def _capture():
+                result["value"] = fn()
+
+            worker = threading.Thread(
+                target=propagate_context_to_thread(_capture)
+            )
+            worker.start()
+            worker.join(timeout=5)
+            self.assertFalse(worker.is_alive(), "worker thread did not finish")
+        finally:
+            reset_hermes_home_override(token)
+        return result["value"]
+
+    def test_worker_thread_resolves_own_profile_via_contextvar(self):
+        """Profile A's turn and profile B's turn, each on its own worker
+        thread under its own override, resolve only their own client."""
+        client_a = object()
+        client_b = object()
+        binding.publish(client_a, profile_key="/profiles/a")
+        binding.publish(client_b, profile_key="/profiles/b")
+
+        self.assertIs(
+            self._resolve_in_profile_scope("/profiles/a", doc_get_client),
+            client_a,
+        )
+        self.assertIs(
+            self._resolve_in_profile_scope("/profiles/b", doc_get_client),
+            client_b,
+        )
+        self.assertIs(
+            self._resolve_in_profile_scope("/profiles/a", drive_get_client),
+            client_a,
+        )
+        self.assertIs(
+            self._resolve_in_profile_scope("/profiles/b", drive_get_client),
+            client_b,
+        )
+
+    def test_unrelated_profile_scope_resolves_nothing(self):
+        """A profile with no published binding must resolve to None —
+        never a sibling profile's client."""
+        client_b = object()
+        binding.publish(client_b, profile_key="/profiles/b")
+
+        self.assertIsNone(
+            self._resolve_in_profile_scope("/profiles/a", doc_get_client)
+        )
+        self.assertIsNone(
+            self._resolve_in_profile_scope("/profiles/a", drive_get_client)
         )
 
 
