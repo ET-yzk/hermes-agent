@@ -91,7 +91,7 @@ token). Other sessions do not see it.
 
 ## `feishu_doc` toolset
 
-Available on `hermes-feishu` (the regular Feishu chat adapter) and in the Feishu document-comment intelligent-reply handler. In chat/DM sessions the gateway's lark client is used; in comment threads the handler injects the comment-scoped client.
+Scoped to the Feishu document-comment intelligent-reply handler (`plugins/platforms/feishu/feishu_comment.py`). Also exposed on `hermes-feishu`: in chat/DM sessions the gateway's lark client is used; in comment threads the handler injects the comment-scoped client.
 
 | Tool | Description | Requires environment |
 |------|-------------|----------------------|

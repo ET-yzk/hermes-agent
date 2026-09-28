@@ -1580,7 +1580,6 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_thread_loop = None
         self._loop = None
         self._event_handler = None
-        self._client = None
         self._shutdown_sdk_executor()
         self._persist_seen_message_ids()
         await self._release_app_lock()

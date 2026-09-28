@@ -18,6 +18,8 @@ Covers the ownership guarantees required for the DM-fallback fix:
    its own client with no explicit profile_key.
 """
 
+import os
+import shutil
 import threading
 import unittest
 
@@ -109,6 +111,19 @@ class TestFeishuClientBindingRegistry(unittest.TestCase):
         binding.unpublish(99, profile_key="/profiles/a")
         self.assertIsNotNone(binding.resolve(profile_key="/profiles/a"))
 
+    def test_explicit_empty_string_key_is_not_redirected_to_active_profile(self):
+        """An explicit ``""`` is a (pathological) explicit key, not the
+        implicit active-home key: falsy handling at the call site would
+        silently route it into the active profile's bucket — a cross-
+        principal misroute for a typo like
+        ``os.environ.get("HERMES_HOME", "")``."""
+        client = object()
+        binding.publish(client, profile_key="")
+        # Never lands in the active profile's bucket...
+        self.assertIsNot(binding.resolve(), client)
+        # ...and is discoverable only through the same explicit spelling.
+        self.assertIs(binding.resolve(profile_key=""), client)
+
     # -- worker-thread resolution (the DM failure boundary) ----------------
 
     def _resolve_in_worker_thread(self, fn, *args):
@@ -166,6 +181,119 @@ class TestFeishuClientBindingRegistry(unittest.TestCase):
         self.assertIsNone(
             self._resolve_in_worker_thread(drive_get_client)
         )
+
+
+class TestEquivalentHomeCanonicalization(unittest.TestCase):
+    """Witness for the registry-key canonicalization requirement.
+
+    The per-profile generation invariant must be about the physical
+    profile home, not the path spelling used at registry ingress. Keys are
+    canonicalized via ``hermes_home_key()`` (expanduser + resolve +
+    normcase), so an alias/symlink to a profile home and its resolved path
+    must share ONE binding bucket and ONE monotonic generation counter —
+    otherwise a replacement adapter could publish as a new generation under
+    one spelling while a stale credential-bearing client stays discoverable
+    under the other.
+    """
+
+    def setUp(self):
+        binding.clear_all()
+        import tempfile
+
+        self._tmp = tempfile.mkdtemp(prefix="feishu-binding-equiv-")
+        self._real = os.path.join(self._tmp, "real-home")
+        os.makedirs(self._real, exist_ok=True)
+        self._alias = os.path.join(self._tmp, "alias-home")
+        try:
+            os.symlink(self._real, self._alias)
+        except OSError:
+            self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+            self.skipTest("symlinks unavailable on this platform")
+
+    def tearDown(self):
+        binding.clear_all()
+        from tools.feishu_doc_tool import set_client as doc_set_client
+        from tools.feishu_drive_tool import set_client as drive_set_client
+
+        doc_set_client(None)
+        drive_set_client(None)
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_active_profile_key_canonicalizes_equivalent_spellings(self):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        token = set_hermes_home_override(self._alias)
+        try:
+            key_via_alias = binding.active_profile_key()
+        finally:
+            reset_hermes_home_override(token)
+        token = set_hermes_home_override(self._real)
+        try:
+            key_via_real = binding.active_profile_key()
+        finally:
+            reset_hermes_home_override(token)
+        self.assertEqual(key_via_alias, key_via_real)
+
+    def test_equivalent_spellings_share_one_binding_bucket(self):
+        client = object()
+        binding.publish(client, profile_key=self._alias)
+        # The resolved spelling must find the alias-published binding...
+        self.assertIs(binding.resolve(profile_key=self._real), client)
+        # ...and the alias spelling must find itself too.
+        self.assertIs(binding.resolve(profile_key=self._alias), client)
+
+    def test_replacement_across_spellings_advances_one_counter(self):
+        """A replacement published under a second spelling of the same
+        physical home must advance the SAME per-profile generation counter
+        (not two buckets each stuck at 1), and the stale generation's
+        compare-and-remove teardown — issued under the original spelling —
+        must not clear the newer binding."""
+        stale_client = object()
+        fresh_client = object()
+
+        gen_stale = binding.publish(stale_client, profile_key=self._alias)
+        gen_fresh = binding.publish(fresh_client, profile_key=self._real)
+        self.assertGreater(gen_fresh, gen_stale)
+
+        # Stale teardown via the OTHER spelling of the same home.
+        binding.unpublish(gen_stale, profile_key=self._alias)
+        self.assertIs(binding.resolve(profile_key=self._real), fresh_client)
+
+    def test_worker_thread_resolves_across_spellings_via_contextvar(self):
+        """The real DM path: the gateway installs the profile-home override
+        with one spelling while a sibling adapter published under another.
+        The worker-thread tool call must still resolve the owning profile's
+        client, never None and never a sibling profile's client."""
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from tools.thread_context import propagate_context_to_thread
+
+        client = object()
+        sibling_client = object()
+        binding.publish(client, profile_key=self._real)
+        binding.publish(sibling_client, profile_key="/profiles/unrelated-b")
+
+        result = {}
+        token = set_hermes_home_override(self._alias)
+        try:
+
+            def _capture():
+                result["doc"] = doc_get_client()
+                result["drive"] = drive_get_client()
+
+            worker = threading.Thread(target=propagate_context_to_thread(_capture))
+            worker.start()
+            worker.join(timeout=5)
+            self.assertFalse(worker.is_alive(), "worker thread did not finish")
+        finally:
+            reset_hermes_home_override(token)
+        self.assertIs(result["doc"], client)
+        self.assertIs(result["drive"], client)
 
 
 class TestProfileScopeContextvarPropagation(unittest.TestCase):
